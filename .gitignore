@@ -1,0 +1,27 @@
+# Compiled binaries
+expense_tracker
+cpp_expense_tracker/expense_tracker_cpp
+cpp_expense_tracker/expense_tracker_cpp.stripped
+go_expense_tracker/expense_tracker_go
+go_expense_tracker/expense_tracker_go.stripped
+
+# Zig build artifacts
+zig_expense_tracker/zig-out/
+zig_expense_tracker/.zig-cache/
+
+# Rust build artifacts
+rust_expense_tracker/target/
+
+# TypeScript build artifacts
+ts_expense_tracker/dist/
+ts_expense_tracker/node_modules/
+
+# Data files
+expenses.dat
+settlement_status.txt
+
+# IDE
+.vscode/
+
+# OS
+.DS_Store
