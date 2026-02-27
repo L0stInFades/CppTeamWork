@@ -1,7 +1,12 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    // Default to native CPU for maximum performance on the host machine
+    const target = b.standardTargetOptions(.{
+        .default_target = .{
+            .cpu_model = .native,
+        },
+    });
     const optimize = b.standardOptimizeOption(.{});
 
     const exe = b.addExecutable(.{
@@ -11,6 +16,8 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = optimize,
             .link_libc = true,
+            // Strip debug info in release builds to reduce binary size and startup time
+            .strip = if (optimize != .Debug) true else null,
         }),
     });
 

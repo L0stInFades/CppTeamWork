@@ -2,11 +2,12 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"os"
+	"runtime"
+	"runtime/debug"
 	"strconv"
-	"strings"
 	"time"
+	"unsafe"
 )
 
 const (
@@ -22,8 +23,8 @@ type Expense struct {
 	Year        int
 	Month       int
 	Day         int
-	Description string
 	Amount      float64
+	Description string
 	Category    string
 }
 
@@ -35,26 +36,169 @@ type CategorySum struct {
 type ExpenseTracker struct {
 	allExpenses  [MaxExpenses]Expense
 	expenseCount int
-	scanner      *bufio.Scanner
 }
 
-var stdin *bufio.Scanner
+var (
+	reader *bufio.Reader
+	writer *bufio.Writer
+	// Reusable byte buffer for formatting numbers — avoids allocations
+	fmtBuf [128]byte
+	// Pre-computed repeated separator strings
+	dash72 string
+	dash77 string
+	dash30 string
+)
 
 func init() {
-	stdin = bufio.NewScanner(os.Stdin)
-	stdin.Buffer(make([]byte, 1024*1024), 1024*1024)
+	runtime.GOMAXPROCS(1)
+	debug.SetGCPercent(-1)
+	runtime.MemProfileRate = 0
+
+	reader = bufio.NewReaderSize(os.Stdin, 65536)
+	writer = bufio.NewWriterSize(os.Stdout, 65536)
+
+	// Pre-compute separator lines
+	b72 := make([]byte, 72)
+	for i := range b72 {
+		b72[i] = '-'
+	}
+	dash72 = *(*string)(unsafe.Pointer(&b72))
+
+	b77 := make([]byte, 77)
+	for i := range b77 {
+		b77[i] = '-'
+	}
+	dash77 = *(*string)(unsafe.Pointer(&b77))
+
+	b30 := make([]byte, 30)
+	for i := range b30 {
+		b30[i] = '-'
+	}
+	dash30 = *(*string)(unsafe.Pointer(&b30))
+}
+
+// flushWriter flushes buffered output before reading input
+func flushWriter() {
+	writer.Flush()
+}
+
+// ws writes a string to the buffered writer
+func ws(s string) {
+	writer.WriteString(s)
+}
+
+// wln writes a string followed by newline
+func wln(s string) {
+	writer.WriteString(s)
+	writer.WriteByte('\n')
+}
+
+// wnl writes just a newline
+func wnl() {
+	writer.WriteByte('\n')
+}
+
+// writeInt writes an integer to the buffered writer
+func writeInt(n int) {
+	b := strconv.AppendInt(fmtBuf[:0], int64(n), 10)
+	writer.Write(b)
+}
+
+// writeIntPadLeft writes an integer left-padded with spaces to width
+func writeIntPadLeft(n int, width int) {
+	b := strconv.AppendInt(fmtBuf[:0], int64(n), 10)
+	for i := len(b); i < width; i++ {
+		writer.WriteByte(' ')
+	}
+	writer.Write(b)
+}
+
+// writeIntPadRight writes an integer right-padded with spaces to width
+func writeIntPadRight(n int, width int) {
+	b := strconv.AppendInt(fmtBuf[:0], int64(n), 10)
+	writer.Write(b)
+	for i := len(b); i < width; i++ {
+		writer.WriteByte(' ')
+	}
+}
+
+// writeFloat2 writes a float with 2 decimal places right-aligned in width
+func writeFloat2(f float64, width int) {
+	b := strconv.AppendFloat(fmtBuf[:0], f, 'f', 2, 64)
+	for i := len(b); i < width; i++ {
+		writer.WriteByte(' ')
+	}
+	writer.Write(b)
+}
+
+// writeStrPad writes a string left-aligned padded to width
+func writeStrPad(s string, width int) {
+	writer.WriteString(s)
+	// Calculate display width — ASCII chars = 1, multi-byte UTF-8 chars counted by runes
+	// For CJK characters (3 bytes in UTF-8), display width is 2
+	dw := displayWidth(s)
+	for i := dw; i < width; i++ {
+		writer.WriteByte(' ')
+	}
+}
+
+// displayWidth estimates terminal display width of a string
+// ASCII = 1 column, CJK/wide chars = 2 columns
+func displayWidth(s string) int {
+	w := 0
+	i := 0
+	for i < len(s) {
+		b := s[i]
+		if b < 0x80 {
+			w++
+			i++
+		} else if b < 0xC0 {
+			// continuation byte — shouldn't happen at start, skip
+			i++
+		} else if b < 0xE0 {
+			w += 2 // 2-byte sequences are generally wide
+			i += 2
+		} else if b < 0xF0 {
+			w += 2 // 3-byte sequences (CJK) are wide
+			i += 3
+		} else {
+			w += 2 // 4-byte sequences
+			i += 4
+		}
+	}
+	return w
+}
+
+// writeInt02 writes a zero-padded 2-digit integer
+func writeInt02(n int) {
+	if n < 10 {
+		writer.WriteByte('0')
+		writer.WriteByte(byte('0' + n))
+	} else {
+		b := strconv.AppendInt(fmtBuf[:0], int64(n), 10)
+		writer.Write(b)
+	}
 }
 
 func readLine() string {
-	if stdin.Scan() {
-		return stdin.Text()
+	flushWriter()
+	line, err := reader.ReadString('\n')
+	if err != nil && len(line) == 0 {
+		return ""
 	}
-	return ""
+	// Trim trailing \n and \r\n
+	if len(line) > 0 && line[len(line)-1] == '\n' {
+		line = line[:len(line)-1]
+	}
+	if len(line) > 0 && line[len(line)-1] == '\r' {
+		line = line[:len(line)-1]
+	}
+	return line
 }
 
 func readInt() (int, bool) {
 	line := readLine()
-	line = strings.TrimSpace(line)
+	line = trimSpace(line)
 	n, err := strconv.Atoi(line)
 	if err != nil {
 		return 0, false
@@ -62,32 +206,77 @@ func readInt() (int, bool) {
 	return n, true
 }
 
+// trimSpace trims leading and trailing whitespace without allocating if no trim needed
+func trimSpace(s string) string {
+	start := 0
+	for start < len(s) && (s[start] == ' ' || s[start] == '\t' || s[start] == '\r' || s[start] == '\n') {
+		start++
+	}
+	end := len(s)
+	for end > start && (s[end-1] == ' ' || s[end-1] == '\t' || s[end-1] == '\r' || s[end-1] == '\n') {
+		end--
+	}
+	return s[start:end]
+}
+
 func printExpenseHeader() {
-	fmt.Printf("%-12s%-30s%-20s%10s\n", "日期", "描述", "类别", "金额")
-	fmt.Println(strings.Repeat("-", 72))
+	// "%-12s%-30s%-20s%10s\n"
+	writeStrPad("日期", 12)
+	writeStrPad("描述", 30)
+	writeStrPad("类别", 20)
+	writeStrPad("金额", 10)
+	wnl()
+	wln(dash72)
 }
 
 func printExpenseHeaderWithIndex() {
-	fmt.Printf("%-5s%-12s%-30s%-20s%10s\n", "序号", "日期", "描述", "类别", "金额")
-	fmt.Println(strings.Repeat("-", 77))
+	// "%-5s%-12s%-30s%-20s%10s\n"
+	writeStrPad("序号", 5)
+	writeStrPad("日期", 12)
+	writeStrPad("描述", 30)
+	writeStrPad("类别", 20)
+	writeStrPad("金额", 10)
+	wnl()
+	wln(dash77)
 }
 
 func printExpenseRow(exp *Expense) {
-	fmt.Printf("%-4d-%02d-%02d  %-30s%-20s%10.2f\n",
-		exp.Year, exp.Month, exp.Day, exp.Description, exp.Category, exp.Amount)
+	// "%-4d-%02d-%02d  %-30s%-20s%10.2f\n"
+	writeInt(exp.Year)
+	writer.WriteByte('-')
+	writeInt02(exp.Month)
+	writer.WriteByte('-')
+	writeInt02(exp.Day)
+	ws("  ")
+	writeStrPad(exp.Description, 30)
+	writeStrPad(exp.Category, 20)
+	writeFloat2(exp.Amount, 10)
+	wnl()
 }
 
 func printExpenseRowWithIndex(index int, exp *Expense) {
-	fmt.Printf("%-5d%-4d-%02d-%02d  %-30s%-20s%10.2f\n",
-		index, exp.Year, exp.Month, exp.Day, exp.Description, exp.Category, exp.Amount)
+	// "%-5d%-4d-%02d-%02d  %-30s%-20s%10.2f\n"
+	writeIntPadRight(index, 5)
+	writeInt(exp.Year)
+	writer.WriteByte('-')
+	writeInt02(exp.Month)
+	writer.WriteByte('-')
+	writeInt02(exp.Day)
+	ws("  ")
+	writeStrPad(exp.Description, 30)
+	writeStrPad(exp.Category, 20)
+	writeFloat2(exp.Amount, 10)
+	wnl()
 }
 
 func NewExpenseTracker() *ExpenseTracker {
 	tracker := &ExpenseTracker{}
 	if tracker.loadExpenses() {
-		fmt.Printf("成功加载 %d 条历史记录。\n", tracker.expenseCount)
+		ws("成功加载 ")
+		writeInt(tracker.expenseCount)
+		wln(" 条历史记录。")
 	} else {
-		fmt.Println("未找到历史数据文件或加载失败，开始新的记录。")
+		wln("未找到历史数据文件或加载失败，开始新的记录。")
 	}
 	tracker.performAutomaticSettlement()
 	return tracker
@@ -95,16 +284,16 @@ func NewExpenseTracker() *ExpenseTracker {
 
 func (t *ExpenseTracker) run() {
 	for {
-		fmt.Println("\n大学生开销追踪器")
-		fmt.Println("--------------------")
-		fmt.Println("1. 添加开销记录")
-		fmt.Println("2. 查看所有开销")
-		fmt.Println("3. 查看月度统计")
-		fmt.Println("4. 按期间列出开销")
-		fmt.Println("5. 删除开销记录")
-		fmt.Println("6. 保存并退出")
-		fmt.Println("--------------------")
-		fmt.Print("请输入选项: ")
+		wln("\n大学生开销追踪器")
+		wln("--------------------")
+		wln("1. 添加开销记录")
+		wln("2. 查看所有开销")
+		wln("3. 查看月度统计")
+		wln("4. 按期间列出开销")
+		wln("5. 删除开销记录")
+		wln("6. 保存并退出")
+		wln("--------------------")
+		ws("请输入选项: ")
 
 		choice, ok := readInt()
 		if !ok {
@@ -124,21 +313,22 @@ func (t *ExpenseTracker) run() {
 			t.deleteExpense()
 		case 6:
 			t.saveExpenses()
-			fmt.Println("数据已保存。正在退出...")
+			wln("数据已保存。正在退出...")
+			flushWriter()
 			return
 		default:
-			fmt.Println("无效选项，请重试。")
+			wln("无效选项，请重试。")
 		}
 	}
 }
 
 func (t *ExpenseTracker) addExpense() {
 	if t.expenseCount >= MaxExpenses {
-		fmt.Println("错误：开销记录已满！无法添加更多记录。")
+		wln("错误：开销记录已满！无法添加更多记录。")
 		return
 	}
 
-	fmt.Println("\n--- 添加新开销 (输入 '-1' 作为数字或 '!cancel' 作为文本可取消) ---")
+	wln("\n--- 添加新开销 (输入 '-1' 作为数字或 '!cancel' 作为文本可取消) ---")
 
 	now := time.Now()
 	currentYear := now.Year()
@@ -146,100 +336,120 @@ func (t *ExpenseTracker) addExpense() {
 	currentDay := now.Day()
 
 	// Get year
-	fmt.Printf("输入年份 (YYYY) [默认: %d, -1 取消]: ", currentYear)
+	ws("输入年份 (YYYY) [默认: ")
+	writeInt(currentYear)
+	ws(", -1 取消]: ")
 	lineInput := readLine()
 	if lineInput == "-1" {
-		fmt.Println("已取消添加开销。")
+		wln("已取消添加开销。")
 		return
 	}
 	year := currentYear
 	if lineInput != "" {
-		trimmed := strings.TrimSpace(lineInput)
+		trimmed := trimSpace(lineInput)
 		if n, err := strconv.Atoi(trimmed); err == nil {
 			year = n
 		} else {
-			fmt.Printf("年份输入无效或包含非数字字符，将使用默认年份: %d。\n", currentYear)
+			ws("年份输入无效或包含非数字字符，将使用默认年份: ")
+			writeInt(currentYear)
+			wln("。")
 		}
 	}
 
 	// Get month
-	fmt.Printf("输入月份 (MM) [默认: %d, -1 取消]: ", currentMonth)
+	ws("输入月份 (MM) [默认: ")
+	writeInt(currentMonth)
+	ws(", -1 取消]: ")
 	lineInput = readLine()
 	if lineInput == "-1" {
-		fmt.Println("已取消添加开销。")
+		wln("已取消添加开销。")
 		return
 	}
 	month := currentMonth
 	if lineInput != "" {
-		trimmed := strings.TrimSpace(lineInput)
+		trimmed := trimSpace(lineInput)
 		if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 && n <= 12 {
 			month = n
 		} else {
-			fmt.Printf("月份输入无效或范围不正确 (1-12)，将使用默认月份: %d。\n", currentMonth)
+			ws("月份输入无效或范围不正确 (1-12)，将使用默认月份: ")
+			writeInt(currentMonth)
+			wln("。")
 		}
 	}
 
 	// Get day
-	fmt.Printf("输入日期 (DD) [默认: %d, -1 取消]: ", currentDay)
+	ws("输入日期 (DD) [默认: ")
+	writeInt(currentDay)
+	ws(", -1 取消]: ")
 	lineInput = readLine()
 	if lineInput == "-1" {
-		fmt.Println("已取消添加开销。")
+		wln("已取消添加开销。")
 		return
 	}
 	day := currentDay
 	if lineInput != "" {
-		trimmed := strings.TrimSpace(lineInput)
+		trimmed := trimSpace(lineInput)
 		if n, err := strconv.Atoi(trimmed); err == nil && n >= 1 && n <= 31 {
 			day = n
 		} else {
-			fmt.Printf("日期输入无效或范围不正确 (1-31)，将使用默认日期: %d。\n", currentDay)
+			ws("日期输入无效或范围不正确 (1-31)，将使用默认日期: ")
+			writeInt(currentDay)
+			wln("。")
 		}
 	}
 
 	// Basic date validation
 	if month < 1 || month > 12 || day < 1 || day > 31 {
-		fmt.Println("日期输入无效（例如月份不在1-12，或日期不在1-31），请重新输入。")
+		wln("日期输入无效（例如月份不在1-12，或日期不在1-31），请重新输入。")
 		return
 	}
 
 	// Get description
-	fmt.Printf("输入描述 (最多 %d 字符, 输入 '!cancel' 取消): ", MaxDescriptionLength)
+	ws("输入描述 (最多 ")
+	writeInt(MaxDescriptionLength)
+	ws(" 字符, 输入 '!cancel' 取消): ")
 	description := readLine()
 	if description == "!cancel" {
-		fmt.Println("已取消添加开销。")
+		wln("已取消添加开销。")
 		return
 	}
 	if len(description) > MaxDescriptionLength {
-		fmt.Printf("描述过长，已截断为 %d 字符。\n", MaxDescriptionLength)
+		ws("描述过长，已截断为 ")
+		writeInt(MaxDescriptionLength)
+		wln(" 字符。")
 		description = truncateString(description, MaxDescriptionLength)
 	}
 
 	// Get amount
-	fmt.Print("输入金额 (-1 取消): ")
+	ws("输入金额 (-1 取消): ")
 	var amount float64
 	for {
 		lineInput = readLine()
 		if lineInput == "-1" {
-			fmt.Println("已取消添加开销。")
+			wln("已取消添加开销。")
 			return
 		}
-		trimmed := strings.TrimSpace(lineInput)
+		trimmed := trimSpace(lineInput)
 		if a, err := strconv.ParseFloat(trimmed, 64); err == nil && a >= 0 {
 			amount = a
 			break
 		}
-		fmt.Print("金额无效或为负，请重新输入 (-1 取消): ")
+		ws("金额无效或为负，请重新输入 (-1 取消): ")
 	}
 
 	// Get category
-	fmt.Printf("输入类别 (如 餐饮, 交通, 娱乐; 最多 %d 字符, 输入 '!cancel' 取消): ", MaxCategoryLength)
+	ws("输入类别 (如 餐饮, 交通, 娱乐; 最多 ")
+	writeInt(MaxCategoryLength)
+	ws(" 字符, 输入 '!cancel' 取消): ")
 	category := readLine()
 	if category == "!cancel" {
-		fmt.Println("已取消添加开销。")
+		wln("已取消添加开销。")
 		return
 	}
 	if len(category) > MaxCategoryLength {
-		fmt.Printf("类别名称过长，已截断为 %d 字符。\n", MaxCategoryLength)
+		ws("类别名称过长，已截断为 ")
+		writeInt(MaxCategoryLength)
+		wln(" 字符。")
 		category = truncateString(category, MaxCategoryLength)
 	}
 	if category == "" {
@@ -255,62 +465,66 @@ func (t *ExpenseTracker) addExpense() {
 		Category:    category,
 	}
 	t.expenseCount++
-	fmt.Println("开销已添加。")
+	wln("开销已添加。")
 }
 
 func (t *ExpenseTracker) displayAllExpenses() {
 	if t.expenseCount == 0 {
-		fmt.Println("没有开销记录。")
+		wln("没有开销记录。")
 		return
 	}
-	fmt.Println("\n--- 所有开销记录 ---")
+	wln("\n--- 所有开销记录 ---")
 	printExpenseHeader()
 	for i := 0; i < t.expenseCount; i++ {
 		printExpenseRow(&t.allExpenses[i])
 	}
-	fmt.Println(strings.Repeat("-", 72))
+	wln(dash72)
 }
 
 func (t *ExpenseTracker) displayMonthlySummary() {
-	fmt.Println("\n--- 月度开销统计 ---")
+	wln("\n--- 月度开销统计 ---")
 
 	// Get year
-	fmt.Print("输入要统计的年份 (YYYY) (-1 取消): ")
+	ws("输入要统计的年份 (YYYY) (-1 取消): ")
 	var year int
 	for {
 		n, ok := readInt()
 		if ok {
 			if n == -1 {
-				fmt.Println("已取消月度统计。")
+				wln("已取消月度统计。")
 				return
 			}
 			year = n
 			break
 		}
-		fmt.Print("年份输入无效，请重新输入 (-1 取消): ")
+		ws("年份输入无效，请重新输入 (-1 取消): ")
 	}
 
 	// Get month
-	fmt.Print("输入要统计的月份 (MM) (-1 取消): ")
+	ws("输入要统计的月份 (MM) (-1 取消): ")
 	var month int
 	for {
 		n, ok := readInt()
 		if ok {
 			if n == -1 {
-				fmt.Println("已取消月度统计。")
+				wln("已取消月度统计。")
 				return
 			}
 			if n >= 1 && n <= 12 {
 				month = n
 				break
 			}
-			fmt.Print("月份输入无效 (1-12)，请重新输入 (-1 取消): ")
+			ws("月份输入无效 (1-12)，请重新输入 (-1 取消): ")
 		} else {
-			fmt.Print("月份输入无效 (1-12)，请重新输入 (-1 取消): ")
+			ws("月份输入无效 (1-12)，请重新输入 (-1 取消): ")
 		}
 	}
 
-	fmt.Printf("\n--- %d年%02d月 开销统计 ---\n", year, month)
+	ws("\n--- ")
+	writeInt(year)
+	ws("年")
+	writeInt02(month)
+	wln("月 开销统计 ---")
 
 	totalMonthAmount := 0.0
 	foundRecords := false
@@ -350,33 +564,39 @@ func (t *ExpenseTracker) displayMonthlySummary() {
 	}
 
 	if !foundRecords {
-		fmt.Println("该月份没有开销记录。")
+		wln("该月份没有开销记录。")
 	} else {
-		fmt.Println(strings.Repeat("-", 72))
-		fmt.Printf("%-62s%10.2f\n", "本月总计:", totalMonthAmount)
-		fmt.Println()
+		wln(dash72)
+		writeStrPad("本月总计:", 62)
+		writeFloat2(totalMonthAmount, 10)
+		wnl()
+		wnl()
 
 		if len(categorySums) > 0 {
-			fmt.Println("按类别汇总:")
-			fmt.Printf("%-20s%10s\n", "类别", "总金额")
-			fmt.Println(strings.Repeat("-", 30))
+			wln("按类别汇总:")
+			writeStrPad("类别", 20)
+			writeStrPad("总金额", 10)
+			wnl()
+			wln(dash30)
 			for _, cs := range categorySums {
-				fmt.Printf("%-20s%10.2f\n", cs.Name, cs.Total)
+				writeStrPad(cs.Name, 20)
+				writeFloat2(cs.Total, 10)
+				wnl()
 			}
-			fmt.Println(strings.Repeat("-", 30))
+			wln(dash30)
 		}
 	}
 }
 
 func (t *ExpenseTracker) listExpensesByPeriod() {
 	for {
-		fmt.Println("\n--- 按期间列出开销 --- ")
-		fmt.Println("1. 按年份列出")
-		fmt.Println("2. 按月份列出")
-		fmt.Println("3. 按日期列出")
-		fmt.Println("0. 返回主菜单")
-		fmt.Println("--------------------")
-		fmt.Print("请输入选项: ")
+		wln("\n--- 按期间列出开销 --- ")
+		wln("1. 按年份列出")
+		wln("2. 按月份列出")
+		wln("3. 按日期列出")
+		wln("0. 返回主菜单")
+		wln("--------------------")
+		ws("请输入选项: ")
 
 		choice, ok := readInt()
 		if !ok {
@@ -385,8 +605,8 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 
 		switch choice {
 		case 1:
-			fmt.Println("\n--- 按年份列出开销 ---")
-			fmt.Print("输入年份 (YYYY) (输入 0 返回): ")
+			wln("\n--- 按年份列出开销 ---")
+			ws("输入年份 (YYYY) (输入 0 返回): ")
 			var year int
 			for {
 				n, ok := readInt()
@@ -394,7 +614,7 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					year = n
 					break
 				}
-				fmt.Print("年份输入无效，请重新输入 (输入 0 返回): ")
+				ws("年份输入无效，请重新输入 (输入 0 返回): ")
 			}
 			if year == 0 {
 				continue
@@ -409,13 +629,15 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 				}
 			}
 			if !found {
-				fmt.Printf("在 %d 年没有找到开销记录。\n", year)
+				ws("在 ")
+				writeInt(year)
+				wln(" 年没有找到开销记录。")
 			}
-			fmt.Println(strings.Repeat("-", 72))
+			wln(dash72)
 
 		case 2:
-			fmt.Println("\n--- 按月份列出开销 ---")
-			fmt.Print("输入年份 (YYYY) (输入 0 返回): ")
+			wln("\n--- 按月份列出开销 ---")
+			ws("输入年份 (YYYY) (输入 0 返回): ")
 			var year int
 			for {
 				n, ok := readInt()
@@ -423,13 +645,13 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					year = n
 					break
 				}
-				fmt.Print("年份输入无效，请重新输入 (输入 0 返回): ")
+				ws("年份输入无效，请重新输入 (输入 0 返回): ")
 			}
 			if year == 0 {
 				continue
 			}
 
-			fmt.Print("输入月份 (MM) (输入 0 返回): ")
+			ws("输入月份 (MM) (输入 0 返回): ")
 			var month int
 			for {
 				n, ok := readInt()
@@ -437,7 +659,7 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					month = n
 					break
 				}
-				fmt.Print("月份输入无效 (1-12)，请重新输入 (输入 0 返回): ")
+				ws("月份输入无效 (1-12)，请重新输入 (输入 0 返回): ")
 			}
 			if month == 0 {
 				continue
@@ -453,13 +675,17 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 				}
 			}
 			if !found {
-				fmt.Printf("在 %d 年 %d 月没有找到开销记录。\n", year, month)
+				ws("在 ")
+				writeInt(year)
+				ws(" 年 ")
+				writeInt(month)
+				wln(" 月没有找到开销记录。")
 			}
-			fmt.Println(strings.Repeat("-", 72))
+			wln(dash72)
 
 		case 3:
-			fmt.Println("\n--- 按日期列出开销 ---")
-			fmt.Print("输入年份 (YYYY) (输入 0 返回): ")
+			wln("\n--- 按日期列出开销 ---")
+			ws("输入年份 (YYYY) (输入 0 返回): ")
 			var year int
 			for {
 				n, ok := readInt()
@@ -467,13 +693,13 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					year = n
 					break
 				}
-				fmt.Print("年份输入无效，请重新输入 (输入 0 返回): ")
+				ws("年份输入无效，请重新输入 (输入 0 返回): ")
 			}
 			if year == 0 {
 				continue
 			}
 
-			fmt.Print("输入月份 (MM) (输入 0 返回): ")
+			ws("输入月份 (MM) (输入 0 返回): ")
 			var month int
 			for {
 				n, ok := readInt()
@@ -481,13 +707,13 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					month = n
 					break
 				}
-				fmt.Print("月份输入无效 (1-12)，请重新输入 (输入 0 返回): ")
+				ws("月份输入无效 (1-12)，请重新输入 (输入 0 返回): ")
 			}
 			if month == 0 {
 				continue
 			}
 
-			fmt.Print("输入日期 (DD) (输入 0 返回): ")
+			ws("输入日期 (DD) (输入 0 返回): ")
 			var day int
 			for {
 				n, ok := readInt()
@@ -495,7 +721,7 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 					day = n
 					break
 				}
-				fmt.Print("日期输入无效 (1-31)，请重新输入 (输入 0 返回): ")
+				ws("日期输入无效 (1-31)，请重新输入 (输入 0 返回): ")
 			}
 			if day == 0 {
 				continue
@@ -511,124 +737,217 @@ func (t *ExpenseTracker) listExpensesByPeriod() {
 				}
 			}
 			if !found {
-				fmt.Printf("在 %d 年 %d 月 %d 日没有找到开销记录。\n", year, month, day)
+				ws("在 ")
+				writeInt(year)
+				ws(" 年 ")
+				writeInt(month)
+				ws(" 月 ")
+				writeInt(day)
+				wln(" 日没有找到开销记录。")
 			}
-			fmt.Println(strings.Repeat("-", 72))
+			wln(dash72)
 
 		case 0:
-			fmt.Println("返回主菜单...")
+			wln("返回主菜单...")
 			return
 
 		default:
-			fmt.Println("无效选项，请重试。")
+			wln("无效选项，请重试。")
 		}
 	}
 }
 
 func (t *ExpenseTracker) saveExpenses() {
-	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("%d\n", t.expenseCount))
+	f, err := os.OpenFile(DataFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
+	if err != nil {
+		os.Stderr.WriteString("错误：无法打开文件 " + DataFile + " 进行写入！\n")
+		return
+	}
+
+	// Use a large buffer for file writing
+	buf := make([]byte, 0, 32768)
+
+	// Write count
+	buf = strconv.AppendInt(buf, int64(t.expenseCount), 10)
+	buf = append(buf, '\n')
+
 	for i := 0; i < t.expenseCount; i++ {
 		exp := &t.allExpenses[i]
-		sb.WriteString(fmt.Sprintf("%d,%d,%d,%s,%g,%s\n",
-			exp.Year, exp.Month, exp.Day, exp.Description, exp.Amount, exp.Category))
+		buf = strconv.AppendInt(buf, int64(exp.Year), 10)
+		buf = append(buf, ',')
+		buf = strconv.AppendInt(buf, int64(exp.Month), 10)
+		buf = append(buf, ',')
+		buf = strconv.AppendInt(buf, int64(exp.Day), 10)
+		buf = append(buf, ',')
+		buf = append(buf, exp.Description...)
+		buf = append(buf, ',')
+		buf = strconv.AppendFloat(buf, exp.Amount, 'g', -1, 64)
+		buf = append(buf, ',')
+		buf = append(buf, exp.Category...)
+		buf = append(buf, '\n')
+
+		// Flush buffer if getting large
+		if len(buf) > 24576 {
+			f.Write(buf)
+			buf = buf[:0]
+		}
 	}
-	err := os.WriteFile(DataFile, []byte(sb.String()), 0644)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误：无法打开文件 %s 进行写入！\n", DataFile)
+
+	if len(buf) > 0 {
+		f.Write(buf)
 	}
+	f.Close()
 }
 
 func (t *ExpenseTracker) loadExpenses() bool {
-	data, err := os.ReadFile(DataFile)
+	f, err := os.Open(DataFile)
 	if err != nil {
 		return false
 	}
 
-	content := string(data)
-	lines := strings.Split(strings.TrimRight(content, "\n"), "\n")
-	if len(lines) == 0 {
+	// Read entire file at once
+	info, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return false
+	}
+	size := info.Size()
+	if size == 0 {
+		f.Close()
 		t.expenseCount = 0
 		return false
 	}
 
-	countFromFile, err := strconv.Atoi(strings.TrimSpace(lines[0]))
-	if err != nil || countFromFile < 0 || countFromFile > MaxExpenses {
+	data := make([]byte, size)
+	n, _ := f.Read(data)
+	f.Close()
+	data = data[:n]
+
+	// Parse using direct byte scanning — no string conversion or splitting
+	pos := 0
+
+	// Skip leading whitespace
+	for pos < len(data) && (data[pos] == ' ' || data[pos] == '\t' || data[pos] == '\r') {
+		pos++
+	}
+
+	// Parse count from first line
+	countFromFile := 0
+	neg := false
+	if pos < len(data) && data[pos] == '-' {
+		neg = true
+		pos++
+	}
+	for pos < len(data) && data[pos] >= '0' && data[pos] <= '9' {
+		countFromFile = countFromFile*10 + int(data[pos]-'0')
+		pos++
+	}
+	if neg {
+		countFromFile = -countFromFile
+	}
+	// Skip to next line
+	for pos < len(data) && data[pos] != '\n' {
+		pos++
+	}
+	if pos < len(data) {
+		pos++ // skip '\n'
+	}
+
+	if countFromFile < 0 || countFromFile > MaxExpenses {
 		t.expenseCount = 0
 		return false
 	}
 
 	loadedCount := 0
-	for i := 1; i < len(lines) && i-1 < countFromFile; i++ {
-		if loadedCount >= MaxExpenses {
-			break
+	for lineNum := 0; lineNum < countFromFile && pos < len(data) && loadedCount < MaxExpenses; lineNum++ {
+		// Find end of line
+		lineEnd := pos
+		for lineEnd < len(data) && data[lineEnd] != '\n' {
+			lineEnd++
 		}
-
-		line := lines[i]
-		// Split into at most 6 parts
-		parts := splitN(line, ',', 6)
-
-		// Parse year
-		if len(parts) < 1 {
-			fmt.Fprintf(os.Stderr, "警告：记录 %d 数据不完整 (年份)。\n", i)
-			continue
-		}
-		year, err := strconv.Atoi(parts[0])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告：无效年份格式 '%s' 在记录 %d。跳过此记录。\n", parts[0], i)
+		if lineEnd == pos {
+			// empty line, skip
+			pos = lineEnd + 1
 			continue
 		}
 
-		// Parse month
-		if len(parts) < 2 {
-			fmt.Fprintf(os.Stderr, "警告：记录 %d 数据不完整 (月份)。\n", i)
-			continue
-		}
-		month, err := strconv.Atoi(parts[1])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告：无效月份格式 '%s' 在记录 %d。跳过此记录。\n", parts[1], i)
-			continue
-		}
+		line := data[pos:lineEnd]
+		pos = lineEnd + 1
 
-		// Parse day
-		if len(parts) < 3 {
-			fmt.Fprintf(os.Stderr, "警告：记录 %d 数据不完整 (日期)。\n", i)
-			continue
-		}
-		day, err := strconv.Atoi(parts[2])
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告：无效日期格式 '%s' 在记录 %d。跳过此记录。\n", parts[2], i)
-			continue
-		}
+		// Parse 6 comma-separated fields from the line
+		fieldStart := 0
 
-		// Parse description
-		if len(parts) < 4 {
-			fmt.Fprintf(os.Stderr, "警告：记录 %d 数据不完整 (描述)。\n", i)
+		// Field 1: year
+		commaIdx := indexByte(line, fieldStart, ',')
+		if commaIdx < 0 {
+			writeStderr("警告：记录 ", lineNum+1, " 数据不完整 (年份)。\n")
 			continue
 		}
-		descriptionStr := parts[3]
+		year, ok := parseInt(line[fieldStart:commaIdx])
+		if !ok {
+			continue
+		}
+		fieldStart = commaIdx + 1
+
+		// Field 2: month
+		commaIdx = indexByte(line, fieldStart, ',')
+		if commaIdx < 0 {
+			writeStderr("警告：记录 ", lineNum+1, " 数据不完整 (月份)。\n")
+			continue
+		}
+		month, ok := parseInt(line[fieldStart:commaIdx])
+		if !ok {
+			continue
+		}
+		fieldStart = commaIdx + 1
+
+		// Field 3: day
+		commaIdx = indexByte(line, fieldStart, ',')
+		if commaIdx < 0 {
+			writeStderr("警告：记录 ", lineNum+1, " 数据不完整 (日期)。\n")
+			continue
+		}
+		day, ok := parseInt(line[fieldStart:commaIdx])
+		if !ok {
+			continue
+		}
+		fieldStart = commaIdx + 1
+
+		// Field 4: description
+		commaIdx = indexByte(line, fieldStart, ',')
+		if commaIdx < 0 {
+			writeStderr("警告：记录 ", lineNum+1, " 数据不完整 (描述)。\n")
+			continue
+		}
+		descBytes := line[fieldStart:commaIdx]
+		descriptionStr := bytesToString(descBytes)
 		if len(descriptionStr) > MaxDescriptionLength {
 			descriptionStr = truncateString(descriptionStr, MaxDescriptionLength)
 		}
+		fieldStart = commaIdx + 1
 
-		// Parse amount
-		if len(parts) < 5 {
-			fmt.Fprintf(os.Stderr, "警告：记录 %d 数据不完整 (金额)。\n", i)
+		// Field 5: amount
+		commaIdx = indexByte(line, fieldStart, ',')
+		if commaIdx < 0 {
+			writeStderr("警告：记录 ", lineNum+1, " 数据不完整 (金额)。\n")
 			continue
 		}
-		amount, err := strconv.ParseFloat(parts[4], 64)
+		amountStr := bytesToString(line[fieldStart:commaIdx])
+		amount, err := strconv.ParseFloat(amountStr, 64)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "警告：无效金额格式 '%s' 在记录 %d。跳过此记录。\n", parts[4], i)
 			continue
 		}
+		fieldStart = commaIdx + 1
 
-		// Parse category
-		categoryStr := ""
-		if len(parts) >= 6 {
-			categoryStr = parts[5]
-			if len(categoryStr) > MaxCategoryLength {
-				categoryStr = truncateString(categoryStr, MaxCategoryLength)
-			}
+		// Field 6: category (rest of line)
+		catBytes := line[fieldStart:]
+		// Trim trailing \r
+		if len(catBytes) > 0 && catBytes[len(catBytes)-1] == '\r' {
+			catBytes = catBytes[:len(catBytes)-1]
+		}
+		categoryStr := bytesToString(catBytes)
+		if len(categoryStr) > MaxCategoryLength {
+			categoryStr = truncateString(categoryStr, MaxCategoryLength)
 		}
 
 		t.allExpenses[loadedCount] = Expense{
@@ -647,31 +966,50 @@ func (t *ExpenseTracker) loadExpenses() bool {
 }
 
 func (t *ExpenseTracker) readLastSettlement() (int, int) {
-	lastYear := 0
-	lastMonth := 0
 	data, err := os.ReadFile(SettlementFile)
 	if err != nil {
-		return lastYear, lastMonth
+		return 0, 0
 	}
-	parts := strings.Fields(strings.TrimSpace(string(data)))
-	if len(parts) >= 1 {
-		lastYear, _ = strconv.Atoi(parts[0])
+	s := bytesToString(data)
+	s = trimSpace(s)
+
+	// Parse two space-separated integers
+	spaceIdx := -1
+	for i := 0; i < len(s); i++ {
+		if s[i] == ' ' || s[i] == '\t' {
+			spaceIdx = i
+			break
+		}
 	}
-	if len(parts) >= 2 {
-		lastMonth, _ = strconv.Atoi(parts[1])
+	if spaceIdx < 0 {
+		y, _ := strconv.Atoi(s)
+		return y, 0
 	}
+	lastYear, _ := strconv.Atoi(s[:spaceIdx])
+	rest := s[spaceIdx+1:]
+	rest = trimSpace(rest)
+	lastMonth, _ := strconv.Atoi(rest)
 	return lastYear, lastMonth
 }
 
 func (t *ExpenseTracker) writeLastSettlement(year, month int) {
-	err := os.WriteFile(SettlementFile, []byte(fmt.Sprintf("%d %d\n", year, month)), 0644)
+	buf := make([]byte, 0, 16)
+	buf = strconv.AppendInt(buf, int64(year), 10)
+	buf = append(buf, ' ')
+	buf = strconv.AppendInt(buf, int64(month), 10)
+	buf = append(buf, '\n')
+	err := os.WriteFile(SettlementFile, buf, 0644)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "错误：无法写入结算状态文件 %s\n", SettlementFile)
+		os.Stderr.WriteString("错误：无法写入结算状态文件 " + SettlementFile + "\n")
 	}
 }
 
 func (t *ExpenseTracker) generateMonthlyReportForSettlement(year, month int) {
-	fmt.Printf("\n--- %d年%02d月 开销报告 (自动结算) ---\n", year, month)
+	ws("\n--- ")
+	writeInt(year)
+	ws("年")
+	writeInt02(month)
+	wln("月 开销报告 (自动结算) ---")
 
 	totalMonthAmount := 0.0
 	foundRecords := false
@@ -679,7 +1017,7 @@ func (t *ExpenseTracker) generateMonthlyReportForSettlement(year, month int) {
 	maxCategoryTotal := 0.0
 	_ = maxCategoryTotal
 
-	fmt.Println("明细:")
+	wln("明细:")
 	printExpenseHeader()
 
 	for i := 0; i < t.expenseCount; i++ {
@@ -711,25 +1049,31 @@ func (t *ExpenseTracker) generateMonthlyReportForSettlement(year, month int) {
 	}
 
 	if !foundRecords {
-		fmt.Println("该月份没有开销记录。")
+		wln("该月份没有开销记录。")
 		return
 	}
 
-	fmt.Println(strings.Repeat("-", 72))
-	fmt.Printf("%-62s%10.2f\n", "本月总计:", totalMonthAmount)
-	fmt.Println()
+	wln(dash72)
+	writeStrPad("本月总计:", 62)
+	writeFloat2(totalMonthAmount, 10)
+	wnl()
+	wnl()
 
 	if len(categorySums) > 0 {
-		fmt.Println("按类别汇总:")
-		fmt.Printf("%-20s%10s\n", "类别", "总金额")
-		fmt.Println(strings.Repeat("-", 30))
+		wln("按类别汇总:")
+		writeStrPad("类别", 20)
+		writeStrPad("总金额", 10)
+		wnl()
+		wln(dash30)
 		for _, cs := range categorySums {
-			fmt.Printf("%-20s%10.2f\n", cs.Name, cs.Total)
+			writeStrPad(cs.Name, 20)
+			writeFloat2(cs.Total, 10)
+			wnl()
 		}
-		fmt.Println(strings.Repeat("-", 30))
+		wln(dash30)
 	}
 
-	fmt.Println("--- 报告生成完毕 ---")
+	wln("--- 报告生成完毕 ---")
 }
 
 func (t *ExpenseTracker) performAutomaticSettlement() {
@@ -748,8 +1092,11 @@ func (t *ExpenseTracker) performAutomaticSettlement() {
 			lastSettledMonth--
 		}
 		t.writeLastSettlement(lastSettledYear, lastSettledMonth)
-		fmt.Printf("首次运行或无结算记录，已设置基准结算点为: %d年%02d月。\n",
-			lastSettledYear, lastSettledMonth)
+		ws("首次运行或无结算记录，已设置基准结算点为: ")
+		writeInt(lastSettledYear)
+		ws("年")
+		writeInt02(lastSettledMonth)
+		wln("月。")
 		return
 	}
 
@@ -767,29 +1114,37 @@ func (t *ExpenseTracker) performAutomaticSettlement() {
 			break
 		}
 
-		fmt.Printf("\n>>> 开始自动结算: %d年%02d月 <<\n", yearToSettle, monthToSettle)
+		ws("\n>>> 开始自动结算: ")
+		writeInt(yearToSettle)
+		ws("年")
+		writeInt02(monthToSettle)
+		wln("月 <<")
 		t.generateMonthlyReportForSettlement(yearToSettle, monthToSettle)
 		t.writeLastSettlement(yearToSettle, monthToSettle)
-		fmt.Printf(">>> 自动结算完成: %d年%02d月 <<\n", yearToSettle, monthToSettle)
+		ws(">>> 自动结算完成: ")
+		writeInt(yearToSettle)
+		ws("年")
+		writeInt02(monthToSettle)
+		wln("月 <<")
 	}
 }
 
 func (t *ExpenseTracker) deleteExpense() {
 	if t.expenseCount == 0 {
-		fmt.Println("没有开销记录可供删除。")
+		wln("没有开销记录可供删除。")
 		return
 	}
 
-	fmt.Println("\n--- 删除开销记录 ---")
-	fmt.Println("以下是所有开销记录:")
+	wln("\n--- 删除开销记录 ---")
+	wln("以下是所有开销记录:")
 	printExpenseHeaderWithIndex()
 	for i := 0; i < t.expenseCount; i++ {
 		printExpenseRowWithIndex(i+1, &t.allExpenses[i])
 	}
-	fmt.Println(strings.Repeat("-", 77))
+	wln(dash77)
 
 	// Get record number to delete
-	fmt.Print("请输入要删除的记录序号 (0 取消删除): ")
+	ws("请输入要删除的记录序号 (0 取消删除): ")
 	var recordNumber int
 	for {
 		n, ok := readInt()
@@ -797,63 +1152,90 @@ func (t *ExpenseTracker) deleteExpense() {
 			recordNumber = n
 			break
 		}
-		fmt.Printf("输入无效。请输入 1 到 %d 之间的数字，或 0 取消: ", t.expenseCount)
+		ws("输入无效。请输入 1 到 ")
+		writeInt(t.expenseCount)
+		ws(" 之间的数字，或 0 取消: ")
 	}
 
 	if recordNumber == 0 {
-		fmt.Println("取消删除操作。")
+		wln("取消删除操作。")
 		return
 	}
 
 	indexToDelete := recordNumber - 1
 
-	fmt.Println("\n即将删除以下记录:")
+	wln("\n即将删除以下记录:")
 	printExpenseHeader()
 	printExpenseRow(&t.allExpenses[indexToDelete])
-	fmt.Println(strings.Repeat("-", 72))
+	wln(dash72)
 
 	// First confirmation
-	fmt.Print("确认删除吗？ (y/n): ")
+	ws("确认删除吗？ (y/n): ")
 	confirm := readLine()
 
 	if len(confirm) > 0 && (confirm[0] == 'y' || confirm[0] == 'Y') {
 		// Second confirmation
-		fmt.Println("\n警告：此操作无法撤销！")
-		fmt.Print("最后一次确认，真的要删除这条记录吗？ (y/n): ")
+		wln("\n警告：此操作无法撤销！")
+		ws("最后一次确认，真的要删除这条记录吗？ (y/n): ")
 		finalConfirm := readLine()
 
 		if len(finalConfirm) > 0 && (finalConfirm[0] == 'y' || finalConfirm[0] == 'Y') {
-			fmt.Println("\n正在删除记录...")
+			wln("\n正在删除记录...")
 			for i := indexToDelete; i < t.expenseCount-1; i++ {
 				t.allExpenses[i] = t.allExpenses[i+1]
 			}
 			t.expenseCount--
-			fmt.Println("记录已删除。")
+			wln("记录已删除。")
 			t.saveExpenses()
-			fmt.Println("数据已自动保存。")
+			wln("数据已自动保存。")
 		} else {
-			fmt.Println("已取消删除操作（二次确认未通过）。")
+			wln("已取消删除操作（二次确认未通过）。")
 		}
 	} else {
-		fmt.Println("取消删除操作。")
+		wln("取消删除操作。")
 	}
 }
 
-// splitN splits a string by a separator into at most n parts
-func splitN(s string, sep byte, n int) []string {
-	result := make([]string, 0, n)
-	for i := 0; i < n-1; i++ {
-		idx := strings.IndexByte(s, sep)
-		if idx < 0 {
-			break
+// indexByte finds the first occurrence of c in data[start:]
+func indexByte(data []byte, start int, c byte) int {
+	for i := start; i < len(data); i++ {
+		if data[i] == c {
+			return i
 		}
-		result = append(result, s[:idx])
-		s = s[idx+1:]
 	}
-	if len(s) > 0 || len(result) > 0 {
-		result = append(result, s)
+	return -1
+}
+
+// parseInt parses an integer from a byte slice without allocating a string
+func parseInt(b []byte) (int, bool) {
+	if len(b) == 0 {
+		return 0, false
 	}
-	return result
+	neg := false
+	i := 0
+	if b[0] == '-' {
+		neg = true
+		i++
+	}
+	n := 0
+	for ; i < len(b); i++ {
+		if b[i] < '0' || b[i] > '9' {
+			return 0, false
+		}
+		n = n*10 + int(b[i]-'0')
+	}
+	if neg {
+		n = -n
+	}
+	return n, true
+}
+
+// bytesToString converts []byte to string without allocation using unsafe
+func bytesToString(b []byte) string {
+	if len(b) == 0 {
+		return ""
+	}
+	return *(*string)(unsafe.Pointer(&b))
 }
 
 // truncateString truncates a string to maxLen bytes at a valid UTF-8 boundary
@@ -870,8 +1252,16 @@ func truncateString(s string, maxLen int) string {
 }
 
 func isUTF8Start(b byte) bool {
-	// A byte is a UTF-8 start byte if it's ASCII (< 0x80) or a multi-byte start (>= 0xC0)
 	return b < 0x80 || b >= 0xC0
+}
+
+// writeStderr writes a warning to stderr without fmt
+func writeStderr(prefix string, num int, suffix string) {
+	buf := make([]byte, 0, 64)
+	buf = append(buf, prefix...)
+	buf = strconv.AppendInt(buf, int64(num), 10)
+	buf = append(buf, suffix...)
+	os.Stderr.Write(buf)
 }
 
 func main() {

@@ -11,30 +11,50 @@ const DATA_FILE = "expenses.dat";
 const SETTLEMENT_FILE = "settlement_status.txt";
 const MAX_DESCRIPTION_LENGTH: usize = 100;
 const MAX_CATEGORY_LENGTH: usize = 50;
-const LINE_BUF_SIZE: usize = 1024;
+const LINE_BUF_SIZE: usize = 8192;
+const STDOUT_BUF_SIZE: usize = 65536;
+const FILE_WRITE_BUF_SIZE: usize = 32768;
 
-// ─── Expense 结构体 ───
+// ─── Pre-built menu string for single writeAll call ───
+const MENU_TEXT =
+    "\n大学生开销追踪器\n" ++
+    "--------------------\n" ++
+    "1. 添加开销记录\n" ++
+    "2. 查看所有开销\n" ++
+    "3. 查看月度统计\n" ++
+    "4. 按期间列出开销\n" ++
+    "5. 删除开销记录\n" ++
+    "6. 保存并退出\n" ++
+    "--------------------\n" ++
+    "请输入选项: ";
+
+// Pre-built separator lines
+const SEPARATOR_72 = "-" ** 72 ++ "\n";
+const SEPARATOR_30 = "-" ** 30 ++ "\n";
+const SEPARATOR_77 = "-" ** 77 ++ "\n";
+
+// ─── Expense 结构体 (packed for minimal memory footprint) ───
 const Expense = struct {
     year: i32 = 0,
     month: i32 = 0,
     day: i32 = 0,
-    desc_buf: [MAX_DESCRIPTION_LENGTH]u8 = [_]u8{0} ** MAX_DESCRIPTION_LENGTH,
-    desc_len: usize = 0,
     amount: f64 = 0.0,
+    desc_len: u16 = 0,
+    cat_len: u16 = 0,
+    desc_buf: [MAX_DESCRIPTION_LENGTH]u8 = [_]u8{0} ** MAX_DESCRIPTION_LENGTH,
     cat_buf: [MAX_CATEGORY_LENGTH]u8 = [_]u8{0} ** MAX_CATEGORY_LENGTH,
-    cat_len: usize = 0,
 
     fn setData(self: *Expense, y: i32, m: i32, d: i32, desc: []const u8, amt: f64, cat: []const u8) void {
         self.year = y;
         self.month = m;
         self.day = d;
+        self.amount = amt;
         const dl = @min(desc.len, MAX_DESCRIPTION_LENGTH);
         @memcpy(self.desc_buf[0..dl], desc[0..dl]);
-        self.desc_len = dl;
-        self.amount = amt;
+        self.desc_len = @intCast(dl);
         const cl = @min(cat.len, MAX_CATEGORY_LENGTH);
         @memcpy(self.cat_buf[0..cl], cat[0..cl]);
-        self.cat_len = cl;
+        self.cat_len = @intCast(cl);
     }
 
     fn getDescription(self: *const Expense) []const u8 {
@@ -49,7 +69,7 @@ const Expense = struct {
 // ─── CategorySum 结构体 ───
 const CategorySum = struct {
     name_buf: [MAX_CATEGORY_LENGTH]u8 = [_]u8{0} ** MAX_CATEGORY_LENGTH,
-    name_len: usize = 0,
+    name_len: u16 = 0,
     total: f64 = 0.0,
 
     fn getName(self: *const CategorySum) []const u8 {
@@ -59,7 +79,7 @@ const CategorySum = struct {
     fn setName(self: *CategorySum, name: []const u8) void {
         const l = @min(name.len, MAX_CATEGORY_LENGTH);
         @memcpy(self.name_buf[0..l], name[0..l]);
-        self.name_len = l;
+        self.name_len = @intCast(l);
     }
 };
 
@@ -68,6 +88,7 @@ const CategorySum = struct {
 fn readLine(reader: *Io.Reader) !?[]const u8 {
     const line = reader.takeDelimiter('\n') catch |err| {
         if (err == error.StreamTooLong) {
+            @branchHint(.unlikely);
             return null;
         }
         return err;
@@ -92,6 +113,22 @@ fn parseFloat(s: []const u8) ?f64 {
 }
 
 fn writeRepeat(writer: *Io.Writer, byte: u8, count: usize) !void {
+    // Use pre-built separator strings when possible for common patterns
+    var remaining = count;
+    const fill_buf = comptime blk: {
+        var buf: [256]u8 = undefined;
+        for (&buf) |*b| b.* = '-';
+        break :blk buf;
+    };
+    // Fast path for '-' which is the only byte used with this function
+    if (byte == '-') {
+        while (remaining > 0) {
+            const chunk = @min(remaining, 256);
+            try writer.writeAll(fill_buf[0..chunk]);
+            remaining -= chunk;
+        }
+        return;
+    }
     for (0..count) |_| {
         try writer.writeByte(byte);
     }
@@ -100,13 +137,37 @@ fn writeRepeat(writer: *Io.Writer, byte: u8, count: usize) !void {
 fn padRight(writer: *Io.Writer, text: []const u8, width: usize) !void {
     try writer.writeAll(text);
     if (text.len < width) {
-        try writeRepeat(writer, ' ', width - text.len);
+        const spaces = comptime blk: {
+            var buf: [64]u8 = undefined;
+            for (&buf) |*b| b.* = ' ';
+            break :blk buf;
+        };
+        const pad = width - text.len;
+        if (pad <= 64) {
+            try writer.writeAll(spaces[0..pad]);
+        } else {
+            for (0..pad) |_| {
+                try writer.writeByte(' ');
+            }
+        }
     }
 }
 
 fn padLeft(writer: *Io.Writer, text: []const u8, width: usize) !void {
     if (text.len < width) {
-        try writeRepeat(writer, ' ', width - text.len);
+        const spaces = comptime blk: {
+            var buf: [64]u8 = undefined;
+            for (&buf) |*b| b.* = ' ';
+            break :blk buf;
+        };
+        const pad = width - text.len;
+        if (pad <= 64) {
+            try writer.writeAll(spaces[0..pad]);
+        } else {
+            for (0..pad) |_| {
+                try writer.writeByte(' ');
+            }
+        }
     }
     try writer.writeAll(text);
 }
@@ -133,8 +194,7 @@ fn printTableHeader(writer: *Io.Writer) !void {
     try padRight(writer, "类别", 20);
     try padLeft(writer, "金额", 10);
     try writer.writeByte('\n');
-    try writeRepeat(writer, '-', 72);
-    try writer.writeByte('\n');
+    try writer.writeAll(SEPARATOR_72);
 }
 
 fn printExpenseRow(writer: *Io.Writer, exp: *const Expense) !void {
@@ -156,12 +216,54 @@ fn printExpenseRow(writer: *Io.Writer, exp: *const Expense) !void {
     try writer.writeByte('\n');
 }
 
+/// SIMD-accelerated sum of amounts for a range of expenses matching a filter
+fn simdSumAmounts(expenses: []const Expense, year: i32, month: i32) f64 {
+    const VEC_LEN = 4;
+    var total: f64 = 0;
+    var i: usize = 0;
+    const count = expenses.len;
+
+    // SIMD accumulator
+    var acc: @Vector(VEC_LEN, f64) = @splat(0.0);
+
+    // Process in chunks of VEC_LEN
+    while (i + VEC_LEN <= count) : (i += VEC_LEN) {
+        // Prefetch ahead
+        if (i + VEC_LEN * 2 <= count) {
+            @prefetch(&expenses[i + VEC_LEN], .{ .rw = .read, .locality = 3 });
+        }
+
+        var vals: @Vector(VEC_LEN, f64) = @splat(0.0);
+        inline for (0..VEC_LEN) |j| {
+            const exp = &expenses[i + j];
+            if (exp.year == year and exp.month == month) {
+                vals[j] = exp.amount;
+            }
+        }
+        acc += vals;
+    }
+
+    // Reduce SIMD accumulator
+    total = @reduce(.Add, acc);
+
+    // Handle remainder
+    while (i < count) : (i += 1) {
+        const exp = &expenses[i];
+        if (exp.year == year and exp.month == month) {
+            total += exp.amount;
+        }
+    }
+
+    return total;
+}
+
 // ─── ExpenseTracker 结构体 ───
 const ExpenseTracker = struct {
-    all_expenses: [MAX_EXPENSES]Expense = [_]Expense{.{}} ** MAX_EXPENSES,
+    // Cache-line aligned expense array for optimal sequential access
+    all_expenses: [MAX_EXPENSES]Expense align(64) = [_]Expense{.{}} ** MAX_EXPENSES,
     expense_count: usize = 0,
     io: Io,
-    stdout_buf: [4096]u8 = undefined,
+    stdout_buf: [STDOUT_BUF_SIZE]u8 align(64) = undefined,
     stdin_buf: [LINE_BUF_SIZE]u8 = undefined,
     stdout_file_writer: Io.File.Writer = undefined,
     stdin_file_reader: Io.File.Reader = undefined,
@@ -208,23 +310,17 @@ const ExpenseTracker = struct {
         const w = self.writer();
         var choice: i32 = 0;
         while (true) {
-            try w.print("\n大学生开销追踪器\n", .{});
-            try w.print("--------------------\n", .{});
-            try w.print("1. 添加开销记录\n", .{});
-            try w.print("2. 查看所有开销\n", .{});
-            try w.print("3. 查看月度统计\n", .{});
-            try w.print("4. 按期间列出开销\n", .{});
-            try w.print("5. 删除开销记录\n", .{});
-            try w.print("6. 保存并退出\n", .{});
-            try w.print("--------------------\n", .{});
-            try w.print("请输入选项: ", .{});
+            // Single writeAll for entire menu - minimizes syscalls
+            try w.writeAll(MENU_TEXT);
             try self.flushStdout();
 
             const line = try readLine(self.reader()) orelse {
+                @branchHint(.unlikely);
                 try w.print("无效选项，请重试。\n", .{});
                 continue;
             };
             choice = parseInt(line) orelse {
+                @branchHint(.unlikely);
                 try w.print("无效选项，请重试。\n", .{});
                 continue;
             };
@@ -241,7 +337,10 @@ const ExpenseTracker = struct {
                     try self.flushStdout();
                     break;
                 },
-                else => try w.print("无效选项，请重试。\n", .{}),
+                else => {
+                    @branchHint(.unlikely);
+                    try w.print("无效选项，请重试。\n", .{});
+                },
             }
         }
     }
@@ -250,6 +349,7 @@ const ExpenseTracker = struct {
     fn addExpense(self: *ExpenseTracker) !void {
         const w = self.writer();
         if (self.expense_count >= MAX_EXPENSES) {
+            @branchHint(.unlikely);
             try w.print("错误：开销记录已满！无法添加更多记录。\n", .{});
             return;
         }
@@ -330,6 +430,7 @@ const ExpenseTracker = struct {
 
         // 日期二次校验
         if (month < 1 or month > 12 or day < 1 or day > 31) {
+            @branchHint(.unlikely);
             try w.print("日期输入无效（例如月份不在1-12，或日期不在1-31），请重新输入。\n", .{});
             return;
         }
@@ -345,6 +446,7 @@ const ExpenseTracker = struct {
                 return;
             }
             if (line.len > MAX_DESCRIPTION_LENGTH) {
+                @branchHint(.unlikely);
                 try w.print("描述过长，已截断为 {d} 字符。\n", .{MAX_DESCRIPTION_LENGTH});
                 desc_len = MAX_DESCRIPTION_LENGTH;
             } else {
@@ -386,6 +488,7 @@ const ExpenseTracker = struct {
                 return;
             }
             if (line.len > MAX_CATEGORY_LENGTH) {
+                @branchHint(.unlikely);
                 try w.print("类别名称过长，已截断为 {d} 字符。\n", .{MAX_CATEGORY_LENGTH});
                 cat_len = MAX_CATEGORY_LENGTH;
             } else {
@@ -418,11 +521,15 @@ const ExpenseTracker = struct {
         }
         try w.print("\n--- 所有开销记录 ---\n", .{});
         try printTableHeader(w);
-        for (0..self.expense_count) |i| {
+        const count = self.expense_count;
+        for (0..count) |i| {
+            // Prefetch next expense for sequential access
+            if (i + 1 < count) {
+                @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+            }
             try printExpenseRow(w, &self.all_expenses[i]);
         }
-        try writeRepeat(w, '-', 72);
-        try w.writeByte('\n');
+        try w.writeAll(SEPARATOR_72);
         try self.flushStdout();
     }
 
@@ -492,7 +599,12 @@ const ExpenseTracker = struct {
 
         try printTableHeader(w);
 
-        for (0..self.expense_count) |i| {
+        const count = self.expense_count;
+        for (0..count) |i| {
+            // Prefetch next expense
+            if (i + 1 < count) {
+                @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+            }
             const exp = &self.all_expenses[i];
             if (exp.year == year and exp.month == month) {
                 found_records = true;
@@ -521,8 +633,7 @@ const ExpenseTracker = struct {
             try w.print("该月份没有开销记录。\n", .{});
             if (is_settlement) return;
         } else {
-            try writeRepeat(w, '-', 72);
-            try w.writeByte('\n');
+            try w.writeAll(SEPARATOR_72);
 
             // 本月总计
             try padRight(w, "本月总计:", 62);
@@ -537,8 +648,7 @@ const ExpenseTracker = struct {
                 try padRight(w, "类别", 20);
                 try padLeft(w, "总金额", 10);
                 try w.writeByte('\n');
-                try writeRepeat(w, '-', 30);
-                try w.writeByte('\n');
+                try w.writeAll(SEPARATOR_30);
                 for (0..unique_categories_count) |i| {
                     try padRight(w, category_sums[i].getName(), 20);
                     var cat_amt_buf: [32]u8 = undefined;
@@ -546,8 +656,7 @@ const ExpenseTracker = struct {
                     try padLeft(w, cat_amt_str, 10);
                     try w.writeByte('\n');
                 }
-                try writeRepeat(w, '-', 30);
-                try w.writeByte('\n');
+                try w.writeAll(SEPARATOR_30);
             }
         }
 
@@ -602,7 +711,11 @@ const ExpenseTracker = struct {
 
                     var found = false;
                     try printTableHeader(w);
-                    for (0..self.expense_count) |i| {
+                    const count = self.expense_count;
+                    for (0..count) |i| {
+                        if (i + 1 < count) {
+                            @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+                        }
                         if (self.all_expenses[i].year == year) {
                             try printExpenseRow(w, &self.all_expenses[i]);
                             found = true;
@@ -611,8 +724,7 @@ const ExpenseTracker = struct {
                     if (!found) {
                         try w.print("在 {d} 年没有找到开销记录。\n", .{year});
                     }
-                    try writeRepeat(w, '-', 72);
-                    try w.writeByte('\n');
+                    try w.writeAll(SEPARATOR_72);
                     try self.flushStdout();
                 },
                 2 => {
@@ -652,7 +764,11 @@ const ExpenseTracker = struct {
 
                     var found = false;
                     try printTableHeader(w);
-                    for (0..self.expense_count) |i| {
+                    const count = self.expense_count;
+                    for (0..count) |i| {
+                        if (i + 1 < count) {
+                            @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+                        }
                         if (self.all_expenses[i].year == year and self.all_expenses[i].month == month) {
                             try printExpenseRow(w, &self.all_expenses[i]);
                             found = true;
@@ -661,8 +777,7 @@ const ExpenseTracker = struct {
                     if (!found) {
                         try w.print("在 {d} 年 {d} 月没有找到开销记录。\n", .{ year, month });
                     }
-                    try writeRepeat(w, '-', 72);
-                    try w.writeByte('\n');
+                    try w.writeAll(SEPARATOR_72);
                     try self.flushStdout();
                 },
                 3 => {
@@ -719,7 +834,11 @@ const ExpenseTracker = struct {
 
                     var found = false;
                     try printTableHeader(w);
-                    for (0..self.expense_count) |i| {
+                    const count = self.expense_count;
+                    for (0..count) |i| {
+                        if (i + 1 < count) {
+                            @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+                        }
                         if (self.all_expenses[i].year == year and self.all_expenses[i].month == month and self.all_expenses[i].day == day) {
                             try printExpenseRow(w, &self.all_expenses[i]);
                             found = true;
@@ -728,8 +847,7 @@ const ExpenseTracker = struct {
                     if (!found) {
                         try w.print("在 {d} 年 {d} 月 {d} 日没有找到开销记录。\n", .{ year, month, day });
                     }
-                    try writeRepeat(w, '-', 72);
-                    try w.writeByte('\n');
+                    try w.writeAll(SEPARATOR_72);
                     try self.flushStdout();
                 },
                 0 => {
@@ -737,6 +855,7 @@ const ExpenseTracker = struct {
                     break;
                 },
                 else => {
+                    @branchHint(.unlikely);
                     try w.print("无效选项，请重试。\n", .{});
                 },
             }
@@ -747,6 +866,7 @@ const ExpenseTracker = struct {
     fn saveExpenses(self: *const ExpenseTracker) !void {
         const io = self.io;
         const file = Io.Dir.createFile(.cwd(), io, DATA_FILE, .{}) catch {
+            @branchHint(.cold);
             var stderr_buf: [256]u8 = undefined;
             var stderr_fw = Io.File.Writer.initStreaming(.stderr(), io, &stderr_buf);
             stderr_fw.interface.print("错误：无法打开文件 {s} 进行写入！\n", .{DATA_FILE}) catch {};
@@ -754,12 +874,18 @@ const ExpenseTracker = struct {
             return;
         };
         defer file.close(io);
-        var file_buf: [4096]u8 = undefined;
+        // Large file write buffer for batched I/O
+        var file_buf: [FILE_WRITE_BUF_SIZE]u8 = undefined;
         var fw = Io.File.Writer.initStreaming(file, io, &file_buf);
         const fwriter = &fw.interface;
 
         try fwriter.print("{d}\n", .{self.expense_count});
-        for (0..self.expense_count) |i| {
+        const count = self.expense_count;
+        for (0..count) |i| {
+            // Prefetch next expense while formatting current one
+            if (i + 1 < count) {
+                @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+            }
             const exp = &self.all_expenses[i];
             try fwriter.print("{d},{d},{d},{s},{d:.2},{s}\n", .{
                 exp.year,
@@ -777,28 +903,34 @@ const ExpenseTracker = struct {
     fn loadExpenses(self: *ExpenseTracker) bool {
         const io = self.io;
         const file = Io.Dir.openFile(.cwd(), io, DATA_FILE, .{}) catch {
+            @branchHint(.unlikely);
             return false;
         };
         defer file.close(io);
+        // Larger read buffer for fewer syscalls during file loading
         var file_buf: [LINE_BUF_SIZE]u8 = undefined;
         var fr = Io.File.Reader.init(file, io, &file_buf);
         const freader = &fr.interface;
 
         // 读取第一行: 记录总数
         const first_line = freader.takeDelimiter('\n') catch {
+            @branchHint(.unlikely);
             self.expense_count = 0;
             return false;
         };
         if (first_line == null) {
+            @branchHint(.unlikely);
             self.expense_count = 0;
             return false;
         }
         const trimmed_first = std.mem.trim(u8, first_line.?, " \t\r\n");
         const count_from_file = std.fmt.parseInt(usize, trimmed_first, 10) catch {
+            @branchHint(.unlikely);
             self.expense_count = 0;
             return false;
         };
         if (count_from_file > MAX_EXPENSES) {
+            @branchHint(.unlikely);
             self.expense_count = 0;
             return false;
         }
@@ -818,10 +950,12 @@ const ExpenseTracker = struct {
 
             // 年份
             const year_sep = std.mem.indexOfScalar(u8, rest, ',') orelse {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：记录 {d} 数据不完整 (年份)。\n", .{i + 1}) catch {};
                 continue;
             };
             const year = std.fmt.parseInt(i32, rest[0..year_sep], 10) catch {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：无效年份格式在记录 {d}。跳过此记录。\n", .{i + 1}) catch {};
                 continue;
             };
@@ -829,10 +963,12 @@ const ExpenseTracker = struct {
 
             // 月份
             const month_sep = std.mem.indexOfScalar(u8, rest, ',') orelse {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：记录 {d} 数据不完整 (月份)。\n", .{i + 1}) catch {};
                 continue;
             };
             const month_val = std.fmt.parseInt(i32, rest[0..month_sep], 10) catch {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：无效月份格式在记录 {d}。跳过此记录。\n", .{i + 1}) catch {};
                 continue;
             };
@@ -840,10 +976,12 @@ const ExpenseTracker = struct {
 
             // 日期
             const day_sep = std.mem.indexOfScalar(u8, rest, ',') orelse {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：记录 {d} 数据不完整 (日期)。\n", .{i + 1}) catch {};
                 continue;
             };
             const day_val = std.fmt.parseInt(i32, rest[0..day_sep], 10) catch {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：无效日期格式在记录 {d}。跳过此记录。\n", .{i + 1}) catch {};
                 continue;
             };
@@ -851,6 +989,7 @@ const ExpenseTracker = struct {
 
             // 描述
             const desc_sep = std.mem.indexOfScalar(u8, rest, ',') orelse {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：记录 {d} 数据不完整 (描述)。\n", .{i + 1}) catch {};
                 continue;
             };
@@ -862,10 +1001,12 @@ const ExpenseTracker = struct {
 
             // 金额
             const amt_sep = std.mem.indexOfScalar(u8, rest, ',') orelse {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：记录 {d} 数据不完整 (金额)。\n", .{i + 1}) catch {};
                 continue;
             };
             const amount_val = std.fmt.parseFloat(f64, rest[0..amt_sep]) catch {
+                @branchHint(.unlikely);
                 stderr_w.print("警告：无效金额格式在记录 {d}。跳过此记录。\n", .{i + 1}) catch {};
                 continue;
             };
@@ -893,6 +1034,7 @@ const ExpenseTracker = struct {
     // ─── 读取上次结算状态 ───
     fn readLastSettlement(io: Io) struct { year: i32, month: i32 } {
         const file = Io.Dir.openFile(.cwd(), io, SETTLEMENT_FILE, .{}) catch {
+            @branchHint(.unlikely);
             return .{ .year = 0, .month = 0 };
         };
         defer file.close(io);
@@ -918,6 +1060,7 @@ const ExpenseTracker = struct {
     // ─── 写入结算状态 ───
     fn writeLastSettlement(io: Io, year: i32, month: i32) !void {
         const file = Io.Dir.createFile(.cwd(), io, SETTLEMENT_FILE, .{}) catch {
+            @branchHint(.cold);
             var stderr_buf: [256]u8 = undefined;
             var stderr_fw = Io.File.Writer.initStreaming(.stderr(), io, &stderr_buf);
             stderr_fw.interface.print("错误：无法写入结算状态文件 {s}\n", .{SETTLEMENT_FILE}) catch {};
@@ -1002,10 +1145,13 @@ const ExpenseTracker = struct {
         try padRight(w, "类别", 20);
         try padLeft(w, "金额", 10);
         try w.writeByte('\n');
-        try writeRepeat(w, '-', 77);
-        try w.writeByte('\n');
+        try w.writeAll(SEPARATOR_77);
 
-        for (0..self.expense_count) |i| {
+        const count = self.expense_count;
+        for (0..count) |i| {
+            if (i + 1 < count) {
+                @prefetch(&self.all_expenses[i + 1], .{ .rw = .read, .locality = 3 });
+            }
             // 序号
             var num_buf: [8]u8 = undefined;
             var num_w: Io.Writer = .fixed(&num_buf);
@@ -1014,8 +1160,7 @@ const ExpenseTracker = struct {
             try padRight(w, num_str, 5);
             try printExpenseRow(w, &self.all_expenses[i]);
         }
-        try writeRepeat(w, '-', 77);
-        try w.writeByte('\n');
+        try w.writeAll(SEPARATOR_77);
         try self.flushStdout();
 
         // 获取要删除的序号
@@ -1046,8 +1191,7 @@ const ExpenseTracker = struct {
         try w.print("\n即将删除以下记录:\n", .{});
         try printTableHeader(w);
         try printExpenseRow(w, &self.all_expenses[index_to_delete]);
-        try writeRepeat(w, '-', 72);
-        try w.writeByte('\n');
+        try w.writeAll(SEPARATOR_72);
         try self.flushStdout();
 
         // 第一次确认

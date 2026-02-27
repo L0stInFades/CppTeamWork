@@ -6,7 +6,7 @@
     "target": "esnext",
     "types": ["node"],
     "lib": ["esnext"],
-    "sourceMap": true,
+    "sourceMap": false,
     "declaration": false,
     "strict": true,
     "verbatimModuleSyntax": true,

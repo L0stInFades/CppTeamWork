@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # ============================================================
-#  五语言开销追踪器 性能对比 Benchmark
+#  五语言开销追踪器 性能对比 Benchmark (优化版 · 顺序执行)
 #  Languages: C++, Zig, Rust, Go, TypeScript
 #  Compatible with Bash 3.2+ (macOS default)
 # ============================================================
@@ -13,6 +13,7 @@ ROOT_DIR="$(cd "$(dirname "$0")" && pwd)"
 export PATH="$HOME/.local/go/current/bin:/usr/local/bin:/usr/local/go/bin:$HOME/go/bin:$HOME/.cargo/bin:/opt/homebrew/bin:$PATH"
 
 # ---------- Colours ----------
+BOLD='\033[1m'
 GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 CYAN='\033[0;36m'
@@ -37,15 +38,12 @@ file_size_bytes() {
 BENCH_TMP=$(mktemp -d /tmp/bench_run_XXXXXX)
 trap 'rm -rf "$BENCH_TMP"' EXIT
 
-# ---------- Fixed language list (indices 0-4) ----------
-# 0=cpp, 1=zig, 2=rust, 3=go, 4=ts
-ALL_IDS="cpp zig rust go ts"
+# ---------- Language labels ----------
 ALL_LABELS_cpp="C++"
 ALL_LABELS_zig="Zig"
 ALL_LABELS_rust="Rust"
 ALL_LABELS_go="Go"
 ALL_LABELS_ts="TypeScript"
-
 get_label() { eval echo "\$ALL_LABELS_$1"; }
 
 # ---------- Detect available languages ----------
@@ -65,17 +63,15 @@ detect rust  "command -v cargo"
 detect go    "command -v go"
 detect ts    "command -v node && command -v npx"
 
-LANGS=$(echo $LANGS)  # trim leading space
+LANGS=$(echo $LANGS)
 
 if [ -z "$LANGS" ]; then
   echo "No language toolchains found. Exiting." >&2
   exit 1
 fi
 
-printf "${CYAN}Benchmarking: %s${NC}\n\n" "$LANGS" >&2
-
-# ---------- Result variables (set dynamically) ----------
-# R_COMPILE_cpp, R_SIZE_cpp, R_STARTUP_cpp, R_BULK_cpp, R_MEMORY_cpp, etc.
+printf "${CYAN}Benchmarking: %s${NC}\n" "$LANGS" >&2
+printf "${CYAN}Mode: sequential (one language at a time)${NC}\n\n" "$LANGS" >&2
 
 # ============================================================
 #  Generate test input files
@@ -97,7 +93,7 @@ BULK_INPUT="$BENCH_TMP/input_bulk.txt"
 } > "$BULK_INPUT"
 
 # ============================================================
-#  Per-language build / binary / run / strip helpers
+#  Per-language helpers
 # ============================================================
 
 build_cpp() {
@@ -105,7 +101,7 @@ build_cpp() {
   rm -f "$dir/expense_tracker_cpp"
   local t0 t1
   t0=$(now_ms)
-  g++ -O2 "$dir/main.cpp" -o "$dir/expense_tracker_cpp" 2>/dev/null
+  g++ -O2 -march=native -mtune=native -flto "$dir/main.cpp" -o "$dir/expense_tracker_cpp" 2>/dev/null
   t1=$(now_ms)
   echo $((t1 - t0))
 }
@@ -144,7 +140,7 @@ build_go() {
   rm -f "$dir/expense_tracker_go"
   local t0 t1
   t0=$(now_ms)
-  (cd "$dir" && go build -o expense_tracker_go 2>/dev/null)
+  (cd "$dir" && go build -ldflags="-s -w" -o expense_tracker_go 2>/dev/null)
   t1=$(now_ms)
   echo $((t1 - t0))
 }
@@ -166,139 +162,126 @@ run_ts()     { node "$ROOT_DIR/ts_expense_tracker/dist/main.js"; }
 strip_ts()   { echo ""; }
 
 # ============================================================
-#  Dimension 1: Compile Time (5 runs, median)
+#  Run all 5 dimensions for ONE language, then move to next
 # ============================================================
-printf "${CYAN}[1/5] Measuring compile times...${NC}\n" >&2
 
-for lang in $LANGS; do
-  printf "  ${GREEN}%s${NC}\n" "$(get_label $lang)" >&2
-  results_file="$BENCH_TMP/compile_${lang}.txt"
+bench_one_lang() {
+  local lang="$1"
+  local label
+  label=$(get_label "$lang")
+
+  printf "\n${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n" >&2
+  printf "${BOLD}${CYAN}  Benchmarking: %s${NC}\n" "$label" >&2
+  printf "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n" >&2
+
+  # ---- [1] Compile Time (5 runs) ----
+  printf "  ${GREEN}[1/5] Compile time${NC}\n" >&2
+  local results_file="$BENCH_TMP/compile_${lang}.txt"
   : > "$results_file"
 
-  # Warmup run (not counted)
-  "build_${lang}" > /dev/null
+  "build_${lang}" > /dev/null  # warmup
 
   for run in $(seq 1 5); do
     ms=$("build_${lang}")
     echo "$ms" >> "$results_file"
-    printf "    run %d: %dms\n" "$run" "$ms" >&2
+    printf "        run %d: %dms\n" "$run" "$ms" >&2
   done
 
+  local val
   val=$(median "$results_file")
   eval "R_COMPILE_${lang}=$val"
-  printf "    → median: %dms\n" "$val" >&2
-done
+  printf "        → median: ${BOLD}%dms${NC}\n" "$val" >&2
 
-# ============================================================
-#  Dimension 2: Binary Size
-# ============================================================
-printf "\n${CYAN}[2/5] Measuring binary sizes...${NC}\n" >&2
-
-for lang in $LANGS; do
+  # ---- [2] Binary Size ----
+  printf "  ${GREEN}[2/5] Binary size${NC}\n" >&2
   "build_${lang}" > /dev/null
 
+  local bin_path size_bytes size_kb
   bin_path=$("binary_${lang}")
   size_bytes=$(file_size_bytes "$bin_path")
   size_kb=$(( (size_bytes + 512) / 1024 ))
 
   if [ "$lang" != "ts" ]; then
+    local stripped stripped_bytes stripped_kb
     stripped=$("strip_${lang}")
     if [ -n "$stripped" ] && [ -f "$stripped" ]; then
       stripped_bytes=$(file_size_bytes "$stripped")
       stripped_kb=$(( (stripped_bytes + 512) / 1024 ))
-      printf "  ${GREEN}%s${NC}: %dKB (stripped: %dKB)\n" "$(get_label $lang)" "$size_kb" "$stripped_kb" >&2
+      printf "        %dKB (stripped: %dKB)\n" "$size_kb" "$stripped_kb" >&2
       eval "R_SIZE_${lang}='${size_kb} (${stripped_kb})'"
       rm -f "$stripped"
     else
-      printf "  ${GREEN}%s${NC}: %dKB\n" "$(get_label $lang)" "$size_kb" >&2
+      printf "        %dKB\n" "$size_kb" >&2
       eval "R_SIZE_${lang}='${size_kb}'"
     fi
   else
-    printf "  ${GREEN}%s${NC}: %dKB (JS bundle)\n" "$(get_label $lang)" "$size_kb" >&2
+    printf "        %dKB (JS bundle)\n" "$size_kb" >&2
     eval "R_SIZE_${lang}='${size_kb}'"
   fi
-done
 
-# ============================================================
-#  Dimension 3: Startup Time (10 runs, median)
-# ============================================================
-printf "\n${CYAN}[3/5] Measuring startup times...${NC}\n" >&2
-
-for lang in $LANGS; do
-  printf "  ${GREEN}%s${NC}\n" "$(get_label $lang)" >&2
+  # ---- [3] Startup Time (10 runs) ----
+  printf "  ${GREEN}[3/5] Startup time${NC}\n" >&2
   results_file="$BENCH_TMP/startup_${lang}.txt"
   : > "$results_file"
 
-  # Warmup
+  local work_dir
   work_dir=$(mktemp -d "$BENCH_TMP/su_w_XXXXXX")
   (cd "$work_dir" && "run_${lang}" < "$COLD_INPUT" > /dev/null 2>&1) || true
   rm -rf "$work_dir"
 
   for run in $(seq 1 10); do
-    work_dir=$(mktemp -d "$BENCH_TMP/su_${lang}_XXXXXX")
+    work_dir=$(mktemp -d "$BENCH_TMP/su_XXXXXX")
+    local t0 t1 ms
     t0=$(now_ms)
     (cd "$work_dir" && "run_${lang}" < "$COLD_INPUT" > /dev/null 2>&1) || true
     t1=$(now_ms)
     ms=$((t1 - t0))
     echo "$ms" >> "$results_file"
-    printf "    run %d: %dms\n" "$run" "$ms" >&2
+    printf "        run %d: %dms\n" "$run" "$ms" >&2
     rm -rf "$work_dir"
   done
 
   val=$(median "$results_file")
   eval "R_STARTUP_${lang}=$val"
-  printf "    → median: %dms\n" "$val" >&2
-done
+  printf "        → median: ${BOLD}%dms${NC}\n" "$val" >&2
 
-# ============================================================
-#  Dimension 4: Bulk Business Performance (10 runs, median)
-# ============================================================
-printf "\n${CYAN}[4/5] Measuring bulk performance (500 records)...${NC}\n" >&2
-
-for lang in $LANGS; do
-  printf "  ${GREEN}%s${NC}\n" "$(get_label $lang)" >&2
+  # ---- [4] Bulk Performance (10 runs) ----
+  printf "  ${GREEN}[4/5] Bulk performance (500 records)${NC}\n" >&2
   results_file="$BENCH_TMP/bulk_${lang}.txt"
   : > "$results_file"
 
-  # Warmup
   work_dir=$(mktemp -d "$BENCH_TMP/bk_w_XXXXXX")
   (cd "$work_dir" && "run_${lang}" < "$BULK_INPUT" > /dev/null 2>&1) || true
   rm -rf "$work_dir"
 
   for run in $(seq 1 10); do
-    work_dir=$(mktemp -d "$BENCH_TMP/bk_${lang}_XXXXXX")
+    work_dir=$(mktemp -d "$BENCH_TMP/bk_XXXXXX")
     t0=$(now_ms)
     (cd "$work_dir" && "run_${lang}" < "$BULK_INPUT" > /dev/null 2>&1) || true
     t1=$(now_ms)
     ms=$((t1 - t0))
     echo "$ms" >> "$results_file"
-    printf "    run %d: %dms\n" "$run" "$ms" >&2
+    printf "        run %d: %dms\n" "$run" "$ms" >&2
     rm -rf "$work_dir"
   done
 
   val=$(median "$results_file")
   eval "R_BULK_${lang}=$val"
-  printf "    → median: %dms\n" "$val" >&2
-done
+  printf "        → median: ${BOLD}%dms${NC}\n" "$val" >&2
 
-# ============================================================
-#  Dimension 5: Peak Memory (5 runs, median)
-# ============================================================
-printf "\n${CYAN}[5/5] Measuring peak memory usage...${NC}\n" >&2
-
-for lang in $LANGS; do
-  printf "  ${GREEN}%s${NC}\n" "$(get_label $lang)" >&2
+  # ---- [5] Peak Memory (5 runs) ----
+  printf "  ${GREEN}[5/5] Peak memory${NC}\n" >&2
   results_file="$BENCH_TMP/mem_${lang}.txt"
   : > "$results_file"
 
-  # Warmup
   work_dir=$(mktemp -d "$BENCH_TMP/mm_w_XXXXXX")
   (cd "$work_dir" && "run_${lang}" < "$BULK_INPUT" > /dev/null 2>&1) || true
   rm -rf "$work_dir"
 
   for run in $(seq 1 5); do
-    work_dir=$(mktemp -d "$BENCH_TMP/mm_${lang}_XXXXXX")
+    work_dir=$(mktemp -d "$BENCH_TMP/mm_XXXXXX")
 
+    local mem_output mem_bytes mem_kb
     if [ "$lang" = "ts" ]; then
       mem_output=$( (cd "$work_dir" && /usr/bin/time -l node "$ROOT_DIR/ts_expense_tracker/dist/main.js" < "$BULK_INPUT" > /dev/null) 2>&1 )
     else
@@ -309,21 +292,32 @@ for lang in $LANGS; do
     mem_bytes=$(echo "$mem_output" | grep "maximum resident set size" | awk '{print $1}')
     mem_kb=$((mem_bytes / 1024))
     echo "$mem_kb" >> "$results_file"
-    printf "    run %d: %dKB\n" "$run" "$mem_kb" >&2
+    printf "        run %d: %dKB\n" "$run" "$mem_kb" >&2
     rm -rf "$work_dir"
   done
 
   val=$(median "$results_file")
   eval "R_MEMORY_${lang}=$val"
-  printf "    → median: %dKB\n" "$val" >&2
+  printf "        → median: ${BOLD}%dKB${NC}\n" "$val" >&2
+
+  printf "  ${GREEN}Done: %s${NC}\n" "$label" >&2
+}
+
+# ============================================================
+#  Main: run each language sequentially
+# ============================================================
+
+for lang in $LANGS; do
+  bench_one_lang "$lang"
 done
 
 # ============================================================
 #  Output: Markdown Table
 # ============================================================
-printf "\n${CYAN}=== Results ===${NC}\n\n" >&2
+printf "\n${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n" >&2
+printf "${BOLD}${CYAN}  Final Results${NC}\n" >&2
+printf "${BOLD}${CYAN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}\n\n" >&2
 
-# Build header
 header="| 指标 |"
 sep="|------|"
 for lang in $LANGS; do
@@ -333,7 +327,6 @@ done
 echo "$header"
 echo "$sep"
 
-# Row helper
 print_row() {
   local metric="$1" prefix="$2"
   local row="| $metric |"
